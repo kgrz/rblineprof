@@ -3,34 +3,11 @@
 #include <time.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <ruby/re.h>
+#include <ruby/intern.h>
+#include <ruby/debug.h>
 
-#if defined(RUBY_VM)
-  #include <ruby/re.h>
-  #include <ruby/intern.h>
-
-  #if defined(HAVE_RB_PROFILE_FRAMES)
-    #include <ruby/debug.h>
-  #else
-    #include <vm_core.h>
-    #include <iseq.h>
-
-    // There's a compile error on 1.9.3. So:
-    #ifdef RTYPEDDATA_DATA
-    #define ruby_current_thread ((rb_thread_t *)RTYPEDDATA_DATA(rb_thread_current()))
-    #endif
-  #endif
-#else
-  #include <st.h>
-  #include <re.h>
-  #include <intern.h>
-  #include <node.h>
-  #include <env.h>
-  typedef rb_event_t rb_event_flag_t;
-#endif
-
-#if defined(HAVE_RB_OS_ALLOCATED_OBJECTS) && defined(RUBY_VM)
 size_t rb_os_allocated_objects(void);
-#endif
 
 static VALUE gc_hook;
 static VALUE sym_total_allocated_object;
@@ -46,9 +23,7 @@ typedef uint64_t prof_time_t;
 typedef struct snapshot {
   prof_time_t wall_time;
   prof_time_t cpu_time;
-#if defined(HAVE_RB_OS_ALLOCATED_OBJECTS) || defined(HAVE_RB_GC_STAT)
   size_t allocated_objects;
-#endif
 } snapshot_t;
 
 /*
@@ -84,13 +59,7 @@ typedef struct sourcefile {
 typedef struct stackframe {
   // data emitted from Ruby to our profiler hook
   rb_event_flag_t event;
-#if defined(HAVE_RB_PROFILE_FRAMES)
   VALUE thread;
-#elif defined(RUBY_VM)
-  rb_thread_t *thread;
-#else
-  NODE *node;
-#endif
   VALUE self;
   ID mid;
   VALUE klass;
@@ -170,9 +139,7 @@ snapshot_diff(snapshot_t *t1, snapshot_t *t2)
   snapshot_t diff = {
     .wall_time         = t1->wall_time - t2->wall_time,
     .cpu_time          = t1->cpu_time  - t2->cpu_time,
-#if defined(HAVE_RB_OS_ALLOCATED_OBJECTS) || defined(HAVE_RB_GC_STAT)
     .allocated_objects = t1->allocated_objects - t2->allocated_objects
-#endif
   };
 
   return diff;
@@ -183,9 +150,7 @@ snapshot_increment(snapshot_t *s, snapshot_t *inc)
 {
   s->wall_time         += inc->wall_time;
   s->cpu_time          += inc->cpu_time;
-#if defined(HAVE_RB_OS_ALLOCATED_OBJECTS) || defined(HAVE_RB_GC_STAT)
   s->allocated_objects += inc->allocated_objects;
-#endif
 }
 
 static inline void
@@ -247,11 +212,7 @@ sourcefile_lookup(char *filename)
   sourcefile_t *srcfile = NULL;
 
   if (rblineprof.source_filename) { // single file mode
-#ifdef RUBY_VM
     if (strcmp(rblineprof.source_filename, filename) == 0) {
-#else
-    if (rblineprof.source_filename == filename) { // compare char*, not contents
-#endif
       srcfile = &rblineprof.file;
       srcfile->filename = filename;
     } else {
@@ -334,11 +295,7 @@ rb_vm_get_sourceline(const rb_control_frame_t *cfp)
 #endif
 
 static void
-#ifdef RUBY_VM
 profiler_hook(rb_event_flag_t event, VALUE data, VALUE self, ID mid, VALUE klass)
-#else
-profiler_hook(rb_event_flag_t event, NODE *node, VALUE self, ID mid, VALUE klass)
-#endif
 {
   char *file;
   long line;
@@ -351,7 +308,6 @@ profiler_hook(rb_event_flag_t event, NODE *node, VALUE self, ID mid, VALUE klass
    * we use ruby_current_node here to get the caller's file/line info,
    * (as opposed to node, which points to the callee method being invoked)
    */
-#if defined(HAVE_RB_PROFILE_FRAMES)
   VALUE path, iseq;
   VALUE iseqs[2];
   int lines[2];
@@ -368,30 +324,6 @@ profiler_hook(rb_event_flag_t event, NODE *node, VALUE self, ID mid, VALUE klass
   if (!RTEST(path)) path = rb_profile_frame_path(iseq);
   file = RSTRING_PTR(path);
   line = l;
-#elif !defined(RUBY_VM)
-  NODE *caller_node = ruby_frame->node;
-  if (!caller_node) return;
-
-  file = caller_node->nd_file;
-  line = nd_line(caller_node);
-#else
-  rb_thread_t *th = ruby_current_thread;
-  rb_control_frame_t *cfp = rb_vm_get_caller(th, th->cfp, mid);
-  if (!cfp) return;
-
-  #ifdef HAVE_TYPE_RB_ISEQ_LOCATION_T
-    if (RTEST(cfp->iseq->location.absolute_path))
-      file = StringValueCStr(cfp->iseq->location.absolute_path);
-    else
-      file = StringValueCStr(cfp->iseq->location.path);
-  #else
-    if (RTEST(cfp->iseq->filepath))
-      file = StringValueCStr(cfp->iseq->filepath);
-    else
-      file = StringValueCStr(cfp->iseq->filename);
-  #endif
-  line = rb_vm_get_sourceline(cfp);
-#endif
 
   if (!file) return;
   if (line <= 0) return;
@@ -415,11 +347,7 @@ profiler_hook(rb_event_flag_t event, NODE *node, VALUE self, ID mid, VALUE klass
   snapshot_t now = {
     .wall_time         = walltime_usec(),
     .cpu_time          = cputime_usec(),
-#if defined(HAVE_RB_OS_ALLOCATED_OBJECTS)
-    .allocated_objects = rb_os_allocated_objects()
-#elif defined(HAVE_RB_GC_STAT)
     .allocated_objects = rb_gc_stat(sym_total_allocated_object)
-#endif
   };
 
   switch (event) {
@@ -442,13 +370,7 @@ profiler_hook(rb_event_flag_t event, NODE *node, VALUE self, ID mid, VALUE klass
         frame->line = line;
         frame->start = now;
         frame->srcfile = srcfile;
-#if defined(HAVE_RB_PROFILE_FRAMES)
         frame->thread = rb_thread_current();
-#elif defined(RUBY_VM)
-        frame->thread = th;
-#else
-        frame->node = node;
-#endif
       }
 
       /* Record when we entered this file for the first time.
@@ -491,11 +413,7 @@ profiler_hook(rb_event_flag_t event, NODE *node, VALUE self, ID mid, VALUE klass
         if (rblineprof.stack_depth > 0)
           rblineprof.stack_depth--;
       } while (frame &&
-#if defined(HAVE_RB_PROFILE_FRAMES)
                frame->thread != rb_thread_current() &&
-#elif defined(RUBY_VM)
-               frame->thread != th &&
-#endif
                /* Break when we find a matching CALL/C_CALL.
                 */
                frame->event != (event == RUBY_EVENT_CALL ? RUBY_EVENT_RETURN : RUBY_EVENT_C_RETURN) &&
@@ -562,35 +480,23 @@ summarize_files(st_data_t key, st_data_t record, st_data_t arg)
   long i;
 
   rb_ary_store(ary, 0, rb_ary_new3(
-#if defined(HAVE_RB_OS_ALLOCATED_OBJECTS) || defined(HAVE_RB_GC_STAT)
     7,
-#else
-    6,
-#endif
     ULL2NUM(srcfile->total.wall_time),
     ULL2NUM(srcfile->child.wall_time),
     ULL2NUM(srcfile->exclusive.wall_time),
     ULL2NUM(srcfile->total.cpu_time),
     ULL2NUM(srcfile->child.cpu_time),
     ULL2NUM(srcfile->exclusive.cpu_time)
-#if defined(HAVE_RB_OS_ALLOCATED_OBJECTS) || defined(HAVE_RB_GC_STAT)
     , ULL2NUM(srcfile->total.allocated_objects)
-#endif
   ));
 
   for (i=1; i<srcfile->nlines; i++)
     rb_ary_store(ary, i, rb_ary_new3(
-#if defined(HAVE_RB_OS_ALLOCATED_OBJECTS) || defined(HAVE_RB_GC_STAT)
       4,
-#else
-      3,
-#endif
       ULL2NUM(srcfile->lines[i].total.wall_time),
       ULL2NUM(srcfile->lines[i].total.cpu_time),
       ULL2NUM(srcfile->lines[i].calls)
-#if defined(HAVE_RB_OS_ALLOCATED_OBJECTS) || defined(HAVE_RB_GC_STAT)
       , ULL2NUM(srcfile->lines[i].total.allocated_objects)
-#endif
     ));
   rb_hash_aset(ret, rb_str_new2(srcfile->filename), ary);
 
@@ -643,11 +549,7 @@ lineprof(VALUE self, VALUE filename)
   rblineprof.cache.srcfile = NULL;
 
   rblineprof.enabled = true;
-#ifndef RUBY_VM
-  rb_add_event_hook((rb_event_hook_func_t) profiler_hook, RUBY_EVENT_CALL|RUBY_EVENT_RETURN|RUBY_EVENT_C_CALL|RUBY_EVENT_C_RETURN);
-#else
   rb_add_event_hook((rb_event_hook_func_t) profiler_hook, RUBY_EVENT_CALL|RUBY_EVENT_RETURN|RUBY_EVENT_C_CALL|RUBY_EVENT_C_RETURN, Qnil);
-#endif
 
   rb_ensure(rb_yield, Qnil, lineprof_ensure, self);
 
